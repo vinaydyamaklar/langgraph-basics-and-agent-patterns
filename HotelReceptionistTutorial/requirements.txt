@@ -1,0 +1,7 @@
+SpeechRecognition~=3.14.3
+openai~=1.108.1
+pyttsx
+pydantic~=2.11.9
+pyaudio
+python-dotenv~=1.1.1
+pyttsx3~=2.99
