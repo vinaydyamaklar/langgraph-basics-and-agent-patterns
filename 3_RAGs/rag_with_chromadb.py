@@ -1,191 +1,214 @@
-import os
-import requests
-import tempfile
-import numpy as np
-from langchain_text_splitters import CharacterTextSplitter
+## langchain imports
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import TextLoader
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import FAISS
-from langchain_community.document_loaders import BSHTMLLoader
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
-from langgraph.checkpoint.memory import InMemorySaver
+## Vector store
+from langchain_community.vectorstores import Chroma
 
-# --- Configuration variables ---
-CHUNK_SIZE = 300
-CHUNK_OVERLAP = 50
-MAX_TOKENS = 15000
-MODEL_NAME = "gpt-4o-mini"
-TEMPERATURE = 0.4
-
-# --- Set up OpenAI API key ---
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    OPENAI_API_KEY = input("Please enter your OpenAI API key: ")
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+## utility imports
+import os
+import numpy as np
+from typing import List
 
 
-# --- Helper Functions (Scraping and Loading) ---
+print("""
+    RAG Architecture:
+    1. Document Loading from various sources
+    2. Document Splitting: Chunking the docs
+    3. Embedding Generation: Convert chunk into vector representation
+    4. Vector Storage: Store embedding in Chroma DB
+    5. Query Processing: query to vector embedding 
+    6. Similarity Search: Find relevant chunk from vector store
+    7. Context Augmentation: Combine retrieved chunks with query
+    8. Response generation: LLM generates answer using context
+    
+    Benefits of RAG:
+    - Reduces hallucinations
+    - Provides up-to-date information
+    - Allows citing sources
+    - Works with domain-specific knowledge
+""")
 
-def fetch_html(url):
-    """Fetches the raw HTML content from a URL."""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        return response.text
-    except requests.RequestException as e:
-        print(f"Error fetching the website: {e}")
-        return None
+## create sample documents
+sample_docs = [
+    """
+    Machine Learning Fundamentals
 
+    Machine learning is a subset of artificial intelligence that enables systems to learn 
+    and improve from experience without being explicitly programmed. There are three main 
+    types of machine learning: supervised learning, unsupervised learning, and reinforcement 
+    learning. Supervised learning uses labeled data to train models, while unsupervised 
+    learning finds patterns in unlabeled data. Reinforcement learning learns through 
+    interaction with an environment using rewards and penalties.
+    """,
 
-def process_website(url):
-    """Loads HTML, splits it into LangChain Documents, and returns the chunks."""
-    html_content = fetch_html(url)
-    if not html_content:
-        raise ValueError("No content could be fetched from the website.")
+    """
+    Deep Learning and Neural Networks
 
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.html') as temp_file:
-        temp_file.write(html_content)
-        temp_file_path = temp_file.name
+    Deep learning is a subset of machine learning based on artificial neural networks. 
+    These networks are inspired by the human brain and consist of layers of interconnected 
+    nodes. Deep learning has revolutionized fields like computer vision, natural language 
+    processing, and speech recognition. Convolutional Neural Networks (CNNs) are particularly 
+    effective for image processing, while Recurrent Neural Networks (RNNs) and Transformers 
+    excel at sequential data processing.
+    """,
 
-    try:
-        loader = BSHTMLLoader(temp_file_path)
-        documents = loader.load()
-    except ImportError:
-        print("'lxml' is not installed. Falling back to built-in 'html.parser'.")
-        loader = BSHTMLLoader(temp_file_path, bs_kwargs={'features': 'html.parser'})
-        documents = loader.load()
+    """
+    Natural Language Processing (NLP)
 
-    os.unlink(temp_file_path)
-    print(f"\nNumber of documents loaded: {len(documents)}")
+    NLP is a field of AI that focuses on the interaction between computers and human language. 
+    Key tasks in NLP include text classification, named entity recognition, sentiment analysis, 
+    machine translation, and question answering. Modern NLP heavily relies on transformer 
+    architectures like BERT, GPT, and T5. These models use attention mechanisms to understand 
+    context and relationships between words in text.
+    """
+]
 
-    text_splitter = CharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separator="\n\n",
-        length_function=len,
-        is_separator_regex=False
-    )
-    texts = text_splitter.split_documents(documents)
-    print(f"Number of text chunks after splitting: {len(texts)}")
-    return texts
-
-
-def print_sample_embeddings(texts, embeddings):
-    """Generates and prints a sample embedding for verification."""
-    if texts:
-        sample_text = texts[0].page_content
-        sample_embedding = embeddings.embed_query(sample_text)
-        print("\nSample Text:")
-        print(sample_text[:200] + "..." if len(sample_text) > 200 else sample_text)
-        print("\nSample Embedding (first 10 dimensions):")
-        print(np.array(sample_embedding[:10]))
-        print(f"\nEmbedding shape: {np.array(sample_embedding).shape}")
-    else:
-        print("No texts available for embedding sample.")
+## Saving sample docs to files
+if not os.path.exists("./temp"):
+    os.mkdir("./temp")
 
 
-def format_docs(docs):
-    """Formats the list of documents into a single string for the prompt's context variable."""
-    return "\n\n".join(doc.page_content for doc in docs)
+for i, doc in enumerate(sample_docs):
+    with open(f"./temp/doc_{i}.txt", "w") as f:
+        f.write(doc)
 
+## Document Loading
+from langchain_community.document_loaders import DirectoryLoader
 
-# --- RAG Pipeline (Simple, Non-LCEL Approach) ---
+loader = DirectoryLoader(
+    "./temp",
+    glob="*.txt",
+    loader_cls=TextLoader,
+    loader_kwargs={"encoding": 'utf-8'}
+)
+documents = loader.load()
 
-# Set up OpenAI language model
-llm = ChatOpenAI(
-    model=MODEL_NAME,
-    temperature=TEMPERATURE,
-    max_tokens=MAX_TOKENS
+print(len(documents))
+
+## Document splitting
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=500, # Maximum size of each chunk
+    chunk_overlap=50, # Overlab between chunks to maintain context
+    length_function=len,
+    separators=[" "] # Hierarchy of separators
+)
+chunks = text_splitter.split_documents(documents)
+
+print(f"Created {len(chunks)} chunks from {len(documents)} documents")
+for c in chunks:
+    print(c)
+
+## Embedding model and Storing document chunks in Chroma DB vector store in vector representation
+os.environ['OPENAI_API_KEY'] = os.environ.get("OPENAI_API_KEY")
+
+# Create chroma DB vector store
+persistent_directory = "./chroma_db"
+
+# Initialize chromadb with OPEN AI Embeddings
+vector_store = Chroma.from_documents(
+    documents=chunks,
+    embedding=OpenAIEmbeddings(),
+    persist_directory=persistent_directory,
+    collection_name="rag_collection"
 )
 
-# Define the Prompt using ChatPromptTemplate
-qa_template = """Context: {context}
-
-Question: {question}
-
-Answer the question concisely based only on the given context. If the context doesn't contain relevant information, say "I don't have enough information to answer that question."
-
-But, if the question is generic, then go ahead and answer the question, example what is a electric vehicle?
-"""
-QA_PROMPT = ChatPromptTemplate.from_template(qa_template)
+print(f"Vector store created with {vector_store._collection.count()} vectors")
+print(f"Persisted to: {persistent_directory}")
 
 
-def rag_pipeline(query, retriever, llm, prompt_template):
-    """
-    Simple RAG pipeline without LCEL - straightforward function calls.
-    """
-    # 1. Retrieve relevant documents
-    docs = retriever.invoke(query)
+## Test similarity search
+query = "What are the types of Machine Learning"
 
-    # 2. Log the retrieved documents
-    print("\nTop 3 most relevant chunks:")
-    for i, doc in enumerate(docs[:3], 1):
-        print(f"{i}. Content: {doc.page_content}...")
-    print("\n" + "=" * 50 + "\n")
+similar_docs = vector_store.similarity_search(query, k=3)
+print(similar_docs)
 
-    # 3. Format the context
-    context_content = format_docs(docs)
-
-    # 4. Print the full prompt (for logging/debugging) - display raw template text
-    print("\nFull Prompt sent to the model:")
-    print(f"Context: {context_content}\n")
-    print(f"Question: {query}\n")
-    print(
-        "Answer the question concisely based only on the given context. If the context doesn't contain relevant information, say \"I don't have enough information to answer that question.\"\n")
-    print("But, if the question is generic, then go ahead and answer the question, example what is a electric vehicle?")
-    print("\n" + "=" * 50 + "\n")
-
-    # 5. Invoke the LLM
-    messages = prompt_template.format_messages(context=context_content, question=query)
-    response = llm.invoke(messages)
-
-    # 7. Extract and return the answer
-    return response.content
+## Advanced similarity search with scores
+result_scores = vector_store.similarity_search_with_score(query, k=3)
+print(result_scores)
 
 
-if __name__ == "__main__":
-    print("Welcome to the Enhanced Web Scraping RAG Pipeline (Simple Version).")
+print("""
+    Understanding Similarity Scores
+    The similarity score represents how closely related a document chunk is to your query. The scoring depends on the distance metric used:
+    
+    ChromaDB default: Uses L2 distance (Euclidean distance)
+    
+    - Lower scores = MORE similar (closer in vector space)
+    - Score of 0 = identical vectors
+    - Typical range: 0 to 2 (but can be higher)
+    
+    
+    Cosine similarity (if configured):
+    
+    - Higher scores = MORE similar
+    - Range: -1 to 1 (1 being identical)
+""")
 
-    while True:
-        url = input("Please enter the URL of the website you want to query (or 'quit' to exit): ")
-        if url.lower() == 'quit':
-            print("Exiting the program. Goodbye!")
-            break
 
-        try:
-            print("Processing website content...")
-            texts = process_website(url)
+## Initialize LLM, RAG Chain, Prompt Template, Query the RAG system
+llm=ChatOpenAI(model="gpt-3.5-turbo")
 
-            if not texts:
-                print("No content found on the website. Please try a different URL.")
-                continue
+# Different wa of initializing LLM model
+# from langchain.chat_models.base import init_chat_model
+# llm=init_chat_model("openai:gpt-3.5-turbo")
 
-            print("Creating embeddings and vector store...")
-            embeddings = OpenAIEmbeddings()
-            print_sample_embeddings(texts, embeddings)
-            vectorstore = FAISS.from_documents(texts, embeddings)
+## Modern RAG Chain
 
-            # Get the retriever from the vectorstore, specifying k=3 retrieval
-            retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+retriever = vector_store.as_retriever(
+    search_kwarg={"k": 3}
+)
 
-            print("\nRAG Pipeline initialized. You can now enter your queries.")
-            print("Enter 'new' to query a new website or 'quit' to exit the program.")
+prompt = ChatPromptTemplate.from_template("""
+    Use the following context to answer the question.
+    If you don't know the answer, say you don't know.
+    
+    Context: {context}
+    
+    Question: {question}
+    
+    Answer:"""
+)
 
-            while True:
-                user_query = input("\nEnter your query: ")
-                if user_query.lower() == 'quit':
-                    print("Exiting the program. Goodbye!")
-                    exit()
-                elif user_query.lower() == 'new':
-                    break
 
-                # Execute the RAG pipeline
-                result = rag_pipeline(user_query, retriever, llm, QA_PROMPT)
-                print(f"RAG Response: {result}")
+# Format documents helper
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
 
-        except Exception as e:
-            print(f"An error occurred: {e}")
-            print("Please try a different URL or check your internet connection.")
+# Create RAG chain using LCEL
+# Create chain that returns both answer and docs
+# RAG chain
+rag_chain = (
+  {"context": retriever | format_docs, "question": RunnablePassthrough()}
+  | prompt
+  | llm
+  | StrOutputParser()
+)
+
+
+# Function to query with sources
+def query_with_sources(question):
+    # Get retrieved documents
+    docs = retriever.invoke(question)
+
+    # Get answer
+    answer = rag_chain.invoke(question)
+
+    return {
+      "answer": answer,
+      "sources": docs,
+      "question": question
+    }
+
+# Use it
+result = query_with_sources("What is Deep learning?")
+print(f"Question: {result['question']}")
+print(f"\nAnswer: {result['answer']}")
+print(f"\nSources ({len(result['sources'])} documents):")
+for i, doc in enumerate(result['sources'], 1):
+  print(f"\n--- Document {i} ---")
+  print(doc.page_content[:200])
