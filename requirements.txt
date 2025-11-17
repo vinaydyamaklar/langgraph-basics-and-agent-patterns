@@ -9,3 +9,5 @@ ipykernel
 Ipython
 arxiv
 wikipedia
+langchain-text-splitters
+chromadb
